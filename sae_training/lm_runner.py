@@ -1,7 +1,3 @@
-import os
-
-import torch
-
 import wandb
 
 # from sae_training.activation_store import ActivationStore
@@ -21,16 +17,7 @@ def language_model_sae_runner(cfg):
     
     # train SAE
     sparse_autoencoder = train_sae_on_language_model(
-        model, sparse_autoencoder, activations_loader,
-        n_checkpoints=cfg.n_checkpoints,
-        batch_size = cfg.train_batch_size,
-        feature_sampling_method = cfg.feature_sampling_method,
-        feature_sampling_window = cfg.feature_sampling_window,
-        feature_reinit_scale = cfg.feature_reinit_scale,
-        dead_feature_threshold = cfg.dead_feature_threshold,
-        dead_feature_window=cfg.dead_feature_window,
-        use_wandb = cfg.log_to_wandb,
-        wandb_log_frequency = cfg.wandb_log_frequency
+        model, sparse_autoencoder, activations_loader, cfg,
     )
 
     # save sae to checkpoints folder

@@ -1,4 +1,5 @@
 from typing import Tuple
+import einops
 import torch
 from transformer_lens import HookedTransformer
 
@@ -100,3 +101,17 @@ def shuffle_activations_pairwise(datapath: str, buffer_idx_range: Tuple[int, int
     # Save them back
     torch.save(shuffled_buffer1, f"{datapath}/{buffer_idx1}.pt")
     torch.save(shuffled_buffer2, f"{datapath}/{buffer_idx2}.pt")
+
+def calc_attn_pattern(q: torch.Tensor, # [batch, seq_pos, d_head]
+                      k: torch.Tensor, # [batch, seq_pos, d_head]
+                      cfg: LanguageModelSAERunnerConfig,
+                      model: HookedTransformer):
+    attn_scores = einops.einsum(q, k, "batch query_pos d_head, \
+                                            batch key_pos d_head -> \
+                                                batch query_pos key_pos")
+    attn_scores /= torch.sqrt(model.cfg.d_head)
+    layer_idx = int(cfg.hook_point.split('.')[1])
+    attn_scores = model.blocks[layer_idx].attn.apply_causal_mask(attn_scores)
+    pattern = torch.nn.functional.softmax(attn_scores, dim=-1)
+    
+    return pattern

@@ -20,7 +20,14 @@ class RunnerConfig(ABC):
     is_dataset_tokenized: bool = True
     context_size: int = 128
     use_cached_activations: bool = False
-    cached_activations_path: Optional[str] = None # Defaults to "activations/{dataset}/{model}/{full_hook_name}_{hook_point_head_index}"
+    
+    # Defaults to "activations/{dataset}/{model}/{full_hook_name}"
+    # (with additional suffixes for head index and qk when appropriate)
+    cached_activations_path: Optional[str] = None 
+    
+    # Instead of measuring the MSE of the activation reconstruction,
+    # measure the MSE of the attn pattern reconstruction
+    use_pattern_reconstruction_loss: bool = False 
     
     # SAE Parameters
     d_in: int = 512
@@ -41,7 +48,14 @@ class RunnerConfig(ABC):
             self.cached_activations_path = f"activations/{self.dataset_path.replace('/', '_')}/{self.model_name.replace('/', '_')}/{self.hook_point}"
             if self.hook_point_head_index is not None:
                 self.cached_activations_path += f"_{self.hook_point_head_index}"
+            if self.use_pattern_reconstruction_loss:
+                self.cached_activations_path += "_qk"
 
+        if self.use_pattern_reconstruction_loss:
+            if self.hook_point[-6:] not in ['hook_q', 'hook_k']:
+                raise ValueError("When use_pattern_reconstruction_loss is True, the hook_point must be a Q or K hook (otherwise it makes no sense to reconstruct the attention pattern).")
+            if self.hook_point_head_index is None:
+                raise NotImplementedError("When use_pattern_reconstruction_loss is True, the hook_point_head_index must be specified (pattern reconstruction for multiple heads hasn't been implemented yet).") 
 
 @dataclass
 class LanguageModelSAERunnerConfig(RunnerConfig):

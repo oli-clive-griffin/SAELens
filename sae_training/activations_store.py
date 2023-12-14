@@ -1,9 +1,85 @@
+from typing import Optional
 import os
+import hashlib
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 from transformer_lens import HookedTransformer
+
+
+class QKActivationsStore:
+    """
+    Auxiliary class used when using pattern reconstruction loss.
+    
+    Stores either query or key activations — if the main activation store is storing
+    query activations, this will store key activations, and vice versa.
+    
+    The format of this activation store is a dictionary where the keys are the
+    SHA256 hashes of the prompts and the values are the activations.
+    """
+    def __init__(self):
+        self.data = {}
+    
+    def insert(self, prompt_tokens: torch.Tensor, activations_tensor: torch.Tensor) -> str:
+        """
+        Insert a tensor into the store, using the SHA256 hash of the prompt as the key.
+        Returns the SHA256 hash of the prompt.
+        """
+        prompt_hash = hashlib.sha256(prompt_tokens.numpy().tobytes()).hexdigest()
+        self.data[prompt_hash] = activations_tensor
+        return prompt_hash
+
+    def get(self, prompt_hash: str, n_tokens_to_return: Optional[int] = None) -> torch.Tensor:
+        """
+        Get a tensor from the store, using the SHA256 hash of the prompt as the key.
+        """
+        if n_tokens_to_return is None:
+            return self.data[prompt_hash]
+        return self.data[prompt_hash][:n_tokens_to_return]
+
+    #! TODO Empty this at the appropriate time (kinda hard to know when to do that because of the way mixing works here)
+    def empty(self):
+        """
+        Empty the store.
+        """
+        self.data = {}
+
+class Activations:
+    """
+    A wrapper around torch.Tensor that allows us to store some additional metadata.
+    """
+    def __init__(self,
+                 tensor: torch.Tensor, # [batch, d_act]
+                 prompt_hash: str, sequence_positions):
+        # TODO check that the tensor is the right shape
+        self.tensor = tensor
+        self.prompt_hash = prompt_hash
+        self.sequence_positions = sequence_positions
+    
+    @staticmethod
+    def cat(*activations_list):
+        """
+        Concatenate a list of Activations objects.
+        """
+        raise NotImplementedError()
+
+    def shuffle(self):
+        """
+        Shuffle the activations in-place.
+        """
+        raise NotImplementedError()
+    
+    def __getitem__(self, idx):
+        """
+        Get a subset of the activations.
+        """
+        raise NotImplementedError()
+    
+    def __len__(self):
+        """
+        Get the number of activations.
+        """
+        raise NotImplementedError()
 
 class ActivationsStore:
     """
@@ -50,6 +126,9 @@ class ActivationsStore:
             # fill buffer half a buffer, so we can mix it with a new buffer
             self.storage_buffer = self.get_buffer(self.cfg.n_batches_in_buffer // 2)
             self.dataloader = self.get_data_loader()
+
+        if self.cfg.use_pattern_reconstruction_loss:
+            self.other_act_store = QKActivationsStore()
 
     def get_batch_tokens(self):
         """
@@ -129,36 +208,50 @@ class ActivationsStore:
 
         return batch_tokens[:batch_size]
 
-    def get_activations(self, batch_tokens):
-        
+    def get_activations(self, batch_tokens) -> Activations:
         act_name = self.cfg.hook_point
         hook_point_layer = self.cfg.hook_point_layer
-        if self.cfg.hook_point_head_index is not None:
-            activations = self.model.run_with_cache(
-                batch_tokens,
-                names_filter=act_name,
-                stop_at_layer=hook_point_layer
-            )[
-                1
-            ][act_name][:,:,self.cfg.hook_point_head_index]
+
+        stop_at_layer = hook_point_layer + 1
+        if self.cfg.use_pattern_reconstruction_loss:
+            # This is k if the hook point is q, and q if the hook point is k
+            other_act_name = act_name[:-1] + ('k' if act_name[-1] == 'q' else 'q')
+            names_filter = [act_name, other_act_name]
         else:
-            activations = self.model.run_with_cache(
-                batch_tokens,
-                names_filter=act_name,
-                stop_at_layer=hook_point_layer+1
-            )[
-                1
-            ][act_name]
+            names_filter = act_name
+            
+        _, cache = self.model.run_with_cache(batch_tokens,
+                                             names_filter=names_filter,
+                                             stop_at_layer=stop_at_layer)
+        
 
-        return activations
-
-    def get_buffer(self, n_batches_in_buffer):
+        if self.cfg.hook_point_head_index is None:
+            # If there's no head specified, just return the activations at the hook point
+            return cache[act_name]
+        
+        if self.cfg.use_pattern_reconstruction_loss:
+            # If we are using a specific head and doing pattern reconstruction,
+            # we want to store the other activation as well
+            # (we're storing each prompt separately)
+            other_act = cache[other_act_name][:, :, self.cfg.hook_point_head_index].clone()
+            for prompt_tokens, other_acts_on_prompt in zip(batch_tokens, other_act):
+                prompt_hash = self.other_act_store.insert(prompt_tokens, other_acts_on_prompt)
+        
+        # Return the activations of the specified head
+        # (Note that we're cloning so that the rest of the tensor can be garbage collected)
+        #! return an Activations instance here
+        return cache[act_name][:,:,self.cfg.hook_point_head_index].clone()
+        
+    def get_buffer(self, n_batches_in_buffer) -> Activations:
         context_size = self.cfg.context_size
         batch_size = self.cfg.store_batch_size
         d_in = self.cfg.d_in
         total_size = batch_size * n_batches_in_buffer
 
         if self.cfg.use_cached_activations:
+            if self.cfg.use_pattern_reconstruction_loss:
+                raise NotImplementedError("Pattern reconstruction loss is not yet supported with cached activations.")
+            
             # Load the activations from disk
             buffer_size = total_size * context_size
             # Initialize an empty tensor (flattened along all dims except d_in)
@@ -215,14 +308,14 @@ class ActivationsStore:
         # pbar = tqdm(total=n_batches_in_buffer, desc="Filling buffer")
         for refill_batch_idx_start in refill_iterator:
             refill_batch_tokens = self.get_batch_tokens()
-            refill_activations = self.get_activations(refill_batch_tokens)
-            new_buffer[
+            refill_activations = self.get_activations(refill_batch_tokens) #! TODO return an Activations instance here
+            new_buffer[ #! Call Activations.cat or something
                 refill_batch_idx_start : refill_batch_idx_start + batch_size
             ] = refill_activations
             
             # pbar.update(1)
 
-        new_buffer = new_buffer.reshape(-1, d_in)
+        new_buffer = new_buffer.reshape(-1, d_in) #! Remove (activations must be [batch, d_act] the whole time)
         new_buffer = new_buffer[torch.randperm(new_buffer.shape[0])]
 
         return new_buffer
@@ -239,12 +332,12 @@ class ActivationsStore:
         batch_size = self.cfg.train_batch_size
         
         # 1. # create new buffer by mixing stored and new buffer
-        mixing_buffer = torch.cat(
+        mixing_buffer = torch.cat( #! Activations.cat
             [self.get_buffer(self.cfg.n_batches_in_buffer // 2),
              self.storage_buffer]
         )
         
-        mixing_buffer = mixing_buffer[torch.randperm(mixing_buffer.shape[0])]
+        mixing_buffer = mixing_buffer[torch.randperm(mixing_buffer.shape[0])] #! Activations.shuffle
         
         # 2.  put 50 % in storage
         self.storage_buffer = mixing_buffer[:mixing_buffer.shape[0]//2] 

@@ -1,36 +1,29 @@
 from functools import partial
 
-import einops
 import torch
+import torch.nn.functional as F
 from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformer_lens import HookedTransformer
 
 import wandb
+from sae_training.config import LanguageModelSAERunnerConfig
 from sae_training.activations_store import ActivationsStore
 from sae_training.optim import get_scheduler
 from sae_training.sparse_autoencoder import SparseAutoencoder
+from sae_training.utils import calc_attn_pattern
 
 
 def train_sae_on_language_model(
     model: HookedTransformer,
     sparse_autoencoder: SparseAutoencoder,
     activation_store: ActivationsStore,
-    batch_size: int = 1024,
-    n_checkpoints: int = 0,
-    feature_sampling_method: str = "l2",  # None, l2, or anthropic
-    feature_sampling_window: int = 1000,  # how many training steps between resampling the features / considiring neurons dead
-    feature_reinit_scale: float = 0.2,  # how much to scale the resampled features by
-    dead_feature_threshold: float = 1e-8,  # how infrequently a feature has to be active to be considered dead
-    dead_feature_window: int = 2000,  # how many training steps before a feature is considered dead
-    use_wandb: bool = False,
-    wandb_log_frequency: int = 50,
+    cfg: LanguageModelSAERunnerConfig,
 ):
+    batch_size = cfg.train_batch_size
+    n_checkpoints = cfg.n_checkpoints
 
-
-    total_training_tokens = sparse_autoencoder.cfg.total_training_tokens
+    total_training_tokens = cfg.total_training_tokens
     total_training_steps = total_training_tokens // batch_size
     n_training_steps = 0
     n_training_tokens = 0
@@ -39,17 +32,16 @@ def train_sae_on_language_model(
         checkpoint_thresholds = list(range(0, total_training_tokens, total_training_tokens // n_checkpoints))[1:]
     
     # track active features
-    act_freq_scores = torch.zeros(sparse_autoencoder.cfg.d_sae, device=sparse_autoencoder.cfg.device)
+    act_freq_scores = torch.zeros(cfg.d_sae, device=cfg.device)
     n_frac_active_tokens = 0
     
-    optimizer = Adam(sparse_autoencoder.parameters(),
-                     lr = sparse_autoencoder.cfg.lr)
+    optimizer = Adam(sparse_autoencoder.parameters(), lr = cfg.lr)
     scheduler = get_scheduler(
-        sparse_autoencoder.cfg.lr_scheduler_name,
+        cfg.lr_scheduler_name,
         optimizer=optimizer,
-        warm_up_steps = sparse_autoencoder.cfg.lr_warm_up_steps, 
+        warm_up_steps = cfg.lr_warm_up_steps, 
         training_steps=total_training_steps,
-        lr_end=sparse_autoencoder.cfg.lr / 10, # heuristic for now. 
+        lr_end=cfg.lr / 10, # heuristic for now. 
     )
     sparse_autoencoder.train()
     
@@ -57,29 +49,30 @@ def train_sae_on_language_model(
     pbar = tqdm(total=total_training_tokens, desc="Training SAE")
     while n_training_tokens < total_training_tokens:
         # Do a training step.
+        activations = activation_store.next_batch()
 
         # Make sure the W_dec is still zero-norm
         sparse_autoencoder.set_decoder_norm_to_unit_norm()
 
         # Resample dead neurons
-        if (feature_sampling_method is not None) and ((n_training_steps + 1) % dead_feature_window == 0):
+        if (cfg.feature_sampling_method is not None) and ((n_training_steps + 1) % cfg.dead_feature_window == 0):
 
             # Get the fraction of neurons active in the previous window
             feature_sparsity = act_freq_scores / n_frac_active_tokens
-            is_dead = (feature_sparsity < sparse_autoencoder.cfg.dead_feature_threshold)
+            is_dead = (feature_sparsity < cfg.dead_feature_threshold)
             
             # if standard resampling <- do this
             n_resampled_neurons = sparse_autoencoder.resample_neurons(
-                activation_store.next_batch(), 
+                activations,
                 feature_sparsity, 
-                feature_reinit_scale,
+                cfg.feature_reinit_scale,
                 optimizer
             )
             # for all the dead neurons, set the feature sparsity to the dead feature threshold
-            act_freq_scores[is_dead] = sparse_autoencoder.cfg.dead_feature_threshold * n_frac_active_tokens
+            act_freq_scores[is_dead] = cfg.dead_feature_threshold * n_frac_active_tokens
             if n_resampled_neurons > 0:
                 print(f"Resampled {n_resampled_neurons} neurons")
-            if use_wandb:
+            if cfg.use_wandb:
                 wandb.log(
                     {
                         "metrics/n_resampled_neurons": n_resampled_neurons,
@@ -92,9 +85,19 @@ def train_sae_on_language_model(
 
         # Forward and Backward Passes
         optimizer.zero_grad()
-        x = activation_store.next_batch()
-        sae_out, feature_acts, loss, mse_loss, l1_loss = sparse_autoencoder(x)
+        sae_out, feature_acts, loss, mse_loss, l1_loss = sparse_autoencoder(activations)
         n_training_tokens += batch_size
+
+        if cfg.use_pattern_reconstruction_loss:
+            # Throw out the MSE loss and instead calculate the pattern reconstruction MSE
+            origial_pattern = calc_attn_pattern(q_activations, k_activations, cfg, model)
+            if cfg.hook_point[-6:] == 'hook_q':
+                reconstructed_pattern = calc_attn_pattern(sae_out, k_activations, cfg, model)
+            else:
+                reconstructed_pattern = calc_attn_pattern(q_activations, sae_out, cfg, model)
+            
+            pattern_mse_loss = F.mse_loss(origial_pattern, reconstructed_pattern)
+            loss = pattern_mse_loss + l1_loss
 
         with torch.no_grad():
             # Calculate the sparsities, and add it to a list, calculate sparsity metrics
@@ -104,15 +107,24 @@ def train_sae_on_language_model(
 
             # metrics for currents acts
             l0 = (feature_acts > 0).float().sum(1).mean()
-            l2_norm_in = torch.norm(x, dim=-1).mean()
+            l2_norm_in = torch.norm(activations, dim=-1).mean()
             l2_norm_out = torch.norm(sae_out, dim=-1).mean()
             l2_norm_ratio = l2_norm_out / l2_norm_in
             current_learning_rate = optimizer.param_groups[0]["lr"]
 
-            if use_wandb and ((n_training_steps + 1) % wandb_log_frequency == 0):
+            if cfg.use_wandb and ((n_training_steps + 1) % cfg.wandb_log_frequency == 0):
+                if cfg.use_pattern_reconstruction_loss:
+                    wandb.log({
+                        "losses/pattern_mse_loss": pattern_mse_loss.item(),
+                        "metric/unused_mse_loss": mse_loss.item(),
+                    })
+                else:
+                    wandb.log({
+                        "losses/mse_loss": mse_loss.item(),
+                    })
+                
                 wandb.log(
                     {
-                        "losses/mse_loss": mse_loss.item(),
                         "losses/l1_loss": l1_loss.item(),
                         "losses/overall_loss": loss.item(),
                         "metrics/l0": l0.item(),
@@ -127,7 +139,7 @@ def train_sae_on_language_model(
                         .mean()
                         .item(),
                         "metrics/dead_features": (
-                            feature_sparsity < dead_feature_threshold
+                            feature_sparsity < cfg.dead_feature_threshold
                         )
                         .float()
                         .mean()
@@ -139,7 +151,7 @@ def train_sae_on_language_model(
                 )
 
             # record loss frequently, but not all the time.
-            if use_wandb and ((n_training_steps + 1) % (wandb_log_frequency * 10) == 0):
+            if cfg.use_wandb and ((n_training_steps + 1) % (cfg.wandb_log_frequency * 10) == 0):
                 # Now we want the reconstruction loss.
                 recons_score, ntp_loss, recons_loss, zero_abl_loss = get_recons_loss(sparse_autoencoder, model, activation_store, num_batches=3)
                 
@@ -155,7 +167,7 @@ def train_sae_on_language_model(
                 )
                     
             # use feature window to log feature sparsity
-            if use_wandb and ((n_training_steps + 1) % feature_sampling_window == 0):
+            if cfg.use_wandb and ((n_training_steps + 1) % cfg.feature_sampling_window == 0):
                 log_feature_sparsity = torch.log10(feature_sparsity + 1e-10)
                 wandb.log(
                     {
@@ -179,8 +191,8 @@ def train_sae_on_language_model(
 
         # checkpoint if at checkpoint frequency
         if n_checkpoints > 0 and n_training_tokens > checkpoint_thresholds[0]:
-            cfg = sparse_autoencoder.cfg
-            path = f"{sparse_autoencoder.cfg.checkpoint_path}/{n_training_tokens}_{sparse_autoencoder.get_name()}.pkl.gz"
+            cfg = cfg
+            path = f"{cfg.checkpoint_path}/{n_training_tokens}_{sparse_autoencoder.get_name()}.pkl.gz"
             sparse_autoencoder.save_model(path)
             checkpoint_thresholds.pop(0)
             if len(checkpoint_thresholds) == 0:
