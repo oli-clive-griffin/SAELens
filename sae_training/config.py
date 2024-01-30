@@ -15,6 +15,9 @@ class RunnerConfig(ABC):
 
     # Data Generating Function (Model + Training Distibuion)
     model_name: str = "gelu-2l"
+    # One SAE to rule them all, one SAE to find them (the features),
+    # one SAE to bring them all and in the black box bind them
+    train_on_full_resid: bool = False
     hook_point: str = "blocks.0.hook_mlp_out"
     hook_point_layer: int = 0
     hook_point_head_index: Optional[int] = None
@@ -42,7 +45,11 @@ class RunnerConfig(ABC):
     def __post_init__(self):
         # Autofill cached_activations_path unless the user overrode it
         if self.cached_activations_path is None:
-            self.cached_activations_path = f"activations/{self.dataset_path.replace('/', '_')}/{self.model_name.replace('/', '_')}/{self.hook_point}"
+            self.cached_activations_path = f"activations/{self.dataset_path.replace('/', '_')}/{self.model_name.replace('/', '_')}/"
+            if self.train_on_full_resid:
+                self.cached_activations_path += "full_resid"
+            else:
+                self.cached_activations_path += self.hook_point
             if self.hook_point_head_index is not None:
                 self.cached_activations_path += f"_{self.hook_point_head_index}"
 

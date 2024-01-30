@@ -1,3 +1,4 @@
+import math
 import os
 
 import torch
@@ -59,6 +60,11 @@ class ActivationsStore:
         """
 
         batch_size = self.cfg.store_batch_size
+        if self.cfg.train_on_full_resid:
+            # we wanna return enough prompts to fill the buffer,
+            # but because we're collecting multiple hook points we don't need as many
+            n_hook_points = 2 * self.model.cfg.n_layers + 1
+            batch_size = math.ceil(batch_size / n_hook_points)
         context_size = self.cfg.context_size
         device = self.cfg.device
 
@@ -131,6 +137,25 @@ class ActivationsStore:
         return batch_tokens[:batch_size]
 
     def get_activations(self, batch_tokens, get_loss=False):
+        if self.cfg.train_on_full_resid:
+            # cache resid_pre and resid_mid on all layers, as well as resid_post on the last one
+            _, cache = self.model.run_with_cache(batch_tokens,
+                                                 names_filter=lambda x: 'resid' in x)
+            activations = []
+            n_layers = self.model.cfg.n_layers
+            for layer_idx in range(n_layers):
+                activations.append(cache['resid_pre', layer_idx])
+                activations.append(cache['resid_mid', layer_idx])
+                if layer_idx == n_layers - 1:
+                    activations.append(cache['resid_post', layer_idx])
+            activations = torch.cat(activations, dim=0)
+            
+            # if the number of activations doesn't match the batch size,
+            # shuffle it and take the first batch_size activations
+            if activations.shape[0] != self.cfg.store_batch_size:
+                activations = activations[torch.randperm(activations.shape[0])]
+                activations = activations[:self.cfg.store_batch_size]
+            return activations
         
         act_name = self.cfg.hook_point
         hook_point_layer = self.cfg.hook_point_layer
