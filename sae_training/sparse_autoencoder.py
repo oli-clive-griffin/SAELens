@@ -111,8 +111,15 @@ class SparseAutoencoder(HookedRootModule):
             residual = x - sae_out
             l2_norm_residual = torch.norm(residual, dim=-1)
             
-            # 2.
-            feature_acts_dead_neurons_only = torch.exp(feature_acts[:, dead_neuron_mask])
+            # 2. 
+            
+            # What we should have had!
+            feature_acts_dead_neurons_only = torch.exp(hidden_pre[:, dead_neuron_mask])
+            
+            # "What we had"
+            # feature_acts_dead_neurons_only = torch.exp(hidden_pre[:, dead_neuron_mask])
+            
+            
             ghost_out =  feature_acts_dead_neurons_only @ self.W_dec[dead_neuron_mask,:]
             l2_norm_ghost_out = torch.norm(ghost_out, dim = -1)
             norm_scaling_factor = l2_norm_residual / (l2_norm_ghost_out* 2)
