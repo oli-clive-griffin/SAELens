@@ -116,7 +116,7 @@ def eval_prompt(
         if "resid_pre" in sparse_autoencoder.cfg.hook_point:
             original_act = original_cache[sparse_autoencoder.cfg.hook_point]
             # token_df["q_norm"] = torch.norm(original_act, dim=-1)[:,1:].flatten().tolist()
-            sae_out, feature_acts, _, mse_loss, _ = sparse_autoencoder(original_act)
+            sae_out, feature_acts, _, mse_loss, _, _ = sparse_autoencoder(original_act)
             # token_df["rec_q_norm"] = torch.norm(sae_out, dim=-1)[:,1:].flatten().tolist()
 
             # need to generate query

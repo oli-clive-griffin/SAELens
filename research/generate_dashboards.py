@@ -319,7 +319,7 @@ class DashboardRunner():
 runner = DashboardRunner(
     sae_path = None,
     dashboard_parent_folder = "../feature_dashboards",
-    wandb_artifact_path = "jbloom/mats_sae_training_gpt2_small_resid_pre_5/sparse_autoencoder_gpt2-small_blocks.10.hook_resid_pre_24576:v19",
+    wandb_artifact_path = "jbloom/mats_sae_training_gpt2_small_resid_pre_5/sparse_autoencoder_gpt2-small_blocks.8.hook_resid_pre_24576:v9",
     init_session = True,
     n_batches_to_sample_from = 2**12,
     n_prompts_to_select = 4096*6,
