@@ -99,7 +99,7 @@ class SparseAutoencoder(HookedRootModule):
         x_centred = x - x.mean(dim=0, keepdim=True)
         mse_loss = (
             torch.pow((sae_out - x.float()), 2)
-            #/ (x_centred**2).sum(dim=-1, keepdim=True).sqrt()
+            / (x_centred**2).sum(dim=-1, keepdim=True).sqrt()
         )
 
         mse_loss_ghost_resid = torch.tensor(0.0, dtype=self.dtype, device=self.device)
@@ -109,23 +109,41 @@ class SparseAutoencoder(HookedRootModule):
 
             # ghost protocol
 
-            # 1.
-            residual = x - sae_out
-            residual_centred = residual - residual.mean(dim=0, keepdim=True)
-            l2_norm_residual = torch.norm(residual, dim=-1)
+            # 1. Get Residual
+            # residual = x - sae_out
+            # residual_centred = residual - residual.mean(dim=0, keepdim=True)
+            # l2_norm_residual = torch.norm(residual, dim=-1)
+            l2_norm_x = torch.norm(x, dim = -1)
 
-            # 2.
+            # 2. New Forward Pass
             feature_acts_dead_neurons_only = torch.exp(hidden_pre[:, dead_neuron_mask])
             ghost_out = feature_acts_dead_neurons_only @ self.W_dec[dead_neuron_mask, :]
+            
+            # 2a. Norm Rescale
             l2_norm_ghost_out = torch.norm(ghost_out, dim=-1)
-            norm_scaling_factor = l2_norm_residual / (1e-6 + l2_norm_ghost_out * 2)
+            
+            # Originally scaling by l2_norm_residal
+            # norm_scaling_factor = l2_norm_residual / (1e-6 + l2_norm_ghost_out * 2)
+            
+            # Now we scale by l2 norm of x 
+            norm_scaling_factor = l2_norm_x / (1e-6 + l2_norm_ghost_out * 2)
             ghost_out = ghost_out * norm_scaling_factor[:, None].detach()
 
-            # 3.
+            # 3. Calculate Loss
+            
+            # Original MSE Loss vs Residual
+            # mse_loss_ghost_resid = (
+            #     torch.pow((ghost_out - residual.detach().float()), 2)
+            #     / (residual_centred.detach() ** 2).sum(dim=-1, keepdim=True).sqrt()
+            # )
+            
+            # New MSE loss vs Input
             mse_loss_ghost_resid = (
-                torch.pow((ghost_out - residual.detach().float()), 2)
-                #/ (residual_centred.detach() ** 2).sum(dim=-1, keepdim=True).sqrt()
+                torch.pow((ghost_out - x.float()), 2)
+                / (x_centred**2).sum(dim=-1, keepdim=True).sqrt()
             )
+            
+            # 3a. Rescaling Factor
             mse_rescaling_factor = (mse_loss / (mse_loss_ghost_resid + 1e-6)).detach()
             mse_loss_ghost_resid = mse_rescaling_factor * mse_loss_ghost_resid
 
