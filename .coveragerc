@@ -1,0 +1,2 @@
+[run]
+omit = sae_training/geom_median/*
