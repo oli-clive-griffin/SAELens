@@ -1,5 +1,6 @@
 from functools import partial
 
+import numpy as np
 import torch
 from transformer_lens import HookedTransformer
 from transformer_lens.utils import get_act_name
@@ -54,7 +55,10 @@ def run_evals(
     if "cuda" in str(model.cfg.device):
         torch.cuda.empty_cache()
 
-    l2_norm_in = torch.norm(original_act, dim=-1)
+    if sparse_autoencoder.cfg.normalize_activations:
+        l2_norm_in = np.sqrt(sparse_autoencoder.cfg.d_in)
+    else:
+        l2_norm_in = torch.norm(original_act, dim=-1)
     l2_norm_out = torch.norm(sae_out, dim=-1)
     l2_norm_ratio = l2_norm_out / l2_norm_in
 

@@ -8,6 +8,7 @@ import pickle
 from functools import partial
 
 import einops
+import numpy as np
 import torch
 import torch.nn.functional as F
 from jaxtyping import Float
@@ -16,6 +17,7 @@ from torch.distributions.categorical import Categorical
 from tqdm import tqdm
 from transformer_lens.hook_points import HookedRootModule, HookPoint
 
+from sae_training.config import LanguageModelSAERunnerConfig
 from sae_training.geom_median.src.geom_median.torch import compute_geometric_median
 
 
@@ -24,7 +26,7 @@ class SparseAutoencoder(HookedRootModule):
 
     def __init__(
         self,
-        cfg,
+        cfg: LanguageModelSAERunnerConfig
     ):
         super().__init__()
         self.cfg = cfg
@@ -47,7 +49,7 @@ class SparseAutoencoder(HookedRootModule):
         self.b_enc = nn.Parameter(
             torch.zeros(self.d_sae, dtype=self.dtype, device=self.device)
         )
-
+        
         self.W_dec = nn.Parameter(
             torch.nn.init.kaiming_uniform_(
                 torch.empty(self.d_sae, self.d_in, dtype=self.dtype, device=self.device)
@@ -62,6 +64,12 @@ class SparseAutoencoder(HookedRootModule):
             torch.zeros(self.d_in, dtype=self.dtype, device=self.device)
         )
 
+        # scaling factor for fine-tuning (not to be used in initial training)
+        self.scaling_factor = nn.Parameter(
+            torch.ones(self.d_sae, dtype=self.dtype, device=self.device)
+        )
+
+
         self.hook_sae_in = HookPoint()
         self.hook_hidden_pre = HookPoint()
         self.hook_hidden_post = HookPoint()
@@ -72,8 +80,12 @@ class SparseAutoencoder(HookedRootModule):
     def forward(self, x, dead_neuron_mask=None):
         # move x to correct dtype
         x = x.to(self.dtype)
+        
+        if self.cfg.normalize_activations:
+            x = (x / (1e-6 + x.norm(dim=-1, keepdim=True)))*np.sqrt(self.cfg.d_in)
+        
         sae_in = self.hook_sae_in(
-            x - self.b_dec
+            x - self.b_dec*self.cfg.use_pre_encoder_bias
         )  # Remove decoder bias as per Anthropic
 
         hidden_pre = self.hook_hidden_pre(
@@ -97,45 +109,98 @@ class SparseAutoencoder(HookedRootModule):
 
         # add config for whether l2 is normalized:
         x_centred = x - x.mean(dim=0, keepdim=True)
-        mse_loss = (
-            torch.pow((sae_out - x.float()), 2)
-            / (x_centred**2).sum(dim=-1, keepdim=True).sqrt()
-        )
+        mse_loss = (torch.pow((sae_out - x.float()), 2))
+        if self.cfg.mse_loss_normalization == "variance":
+            mse_loss = mse_loss / (x_centred**2).sum(dim=-1, keepdim=True).sqrt()
 
         mse_loss_ghost_resid = torch.tensor(0.0, dtype=self.dtype, device=self.device)
         # gate on config and training so evals is not slowed down.
-        if self.cfg.use_ghost_grads and self.training and dead_neuron_mask.sum() > 0:
+        if self.training and dead_neuron_mask.sum() > 0:
+            
             assert dead_neuron_mask is not None
-
             # ghost protocol
-
-            # 1.
-            residual = x - sae_out
-            l2_norm_residual = torch.norm(residual, dim=-1)
-
-            # 2.
-            feature_acts_dead_neurons_only = torch.exp(hidden_pre[:, dead_neuron_mask])
-            ghost_out = feature_acts_dead_neurons_only @ self.W_dec[dead_neuron_mask, :]
-            l2_norm_ghost_out = torch.norm(ghost_out, dim=-1)
-            norm_scaling_factor = l2_norm_residual / (1e-6 + l2_norm_ghost_out * 2)
-            ghost_out = ghost_out * norm_scaling_factor[:, None].detach()
-
-            # 3.
-            mse_loss_ghost_resid = (
-                torch.pow((ghost_out - residual.detach().float()), 2)
-                / (residual.detach() ** 2).sum(dim=-1, keepdim=True).sqrt()
-            )
-            mse_rescaling_factor = (mse_loss / (mse_loss_ghost_resid + 1e-6)).detach()
-            mse_loss_ghost_resid = mse_rescaling_factor * mse_loss_ghost_resid
-
-            mse_loss_ghost_resid = mse_loss_ghost_resid.mean()
+            if self.cfg.ghost_grads == "residual":
+                mse_loss_ghost_resid = self.get_ghost_grad_loss_resid(
+                    x, sae_out, hidden_pre, dead_neuron_mask, mse_loss
+                )
+            elif self.cfg.ghost_grads == "activation":
+                mse_loss_ghost_resid = self.get_ghost_grad_loss_activation(
+                    x, sae_out, hidden_pre, dead_neuron_mask, mse_loss
+                )
 
         mse_loss = mse_loss.mean()
         sparsity = torch.abs(feature_acts).sum(dim=1).mean(dim=(0,))
         l1_loss = self.l1_coefficient * sparsity
         loss = mse_loss + l1_loss + mse_loss_ghost_resid
+        
+        if self.cfg.normalize_activations:
+            sae_out = (sae_out * (1e-6 + x.norm(dim=-1, keepdim=True)))/np.sqrt(self.cfg.d_in)
 
         return sae_out, feature_acts, loss, mse_loss, l1_loss, mse_loss_ghost_resid
+
+    def get_ghost_grad_loss_resid(self, x, sae_out, hidden_pre, dead_neuron_mask, mse_loss):
+        '''
+        Ghost Grad Protocol with fitting the residual per Anthropic's January Update:
+        https://transformer-circuits.pub/2024/jan-update/index.html#dict-learning-resampling
+        '''
+
+        # 1. Get Residual
+        x_centred = x - x.mean(dim=0, keepdim=True)
+        l2_norm_x = torch.norm(x, dim = -1)
+
+        # 2. New Forward Pass
+        feature_acts_dead_neurons_only = torch.exp(hidden_pre[:, dead_neuron_mask])
+        ghost_out = feature_acts_dead_neurons_only @ self.W_dec[dead_neuron_mask, :]
+        
+        # 2a. Norm Rescale
+        l2_norm_ghost_out = torch.norm(ghost_out, dim=-1)
+        
+        # Scale by l2 norm of x 
+        norm_scaling_factor = l2_norm_x / (1e-6 + l2_norm_ghost_out * 2)
+        ghost_out = ghost_out * norm_scaling_factor[:, None].detach()
+
+        # 3. Calculate Loss
+        mse_loss_ghost_resid = torch.pow((ghost_out - x.float()), 2)
+        if self.cfg.mse_loss_normalization == "variance":
+            mse_loss_ghost_resid = mse_loss_ghost_resid / (x_centred.detach() ** 2).sum(dim=-1, keepdim=True).sqrt()
+            
+        # 3a. Rescaling Factor
+        mse_rescaling_factor = (mse_loss / (mse_loss_ghost_resid + 1e-6)).detach()
+        mse_loss_ghost_resid = mse_rescaling_factor * mse_loss_ghost_resid
+
+        mse_loss_ghost_resid = mse_loss_ghost_resid.mean()
+        return mse_loss_ghost_resid
+        
+    def get_ghost_grad_loss_activation(self, x, sae_out, hidden_pre, dead_neuron_mask, mse_loss):
+        '''
+        Ghost Grad Protocol with fitting the residual per Anthropic's January Update.
+        Updated to fit the original activation and not the residuals
+        (has been claimed that this is superior to fitting the residuals)
+        '''
+        # 1.
+        residual = x - sae_out
+        l2_norm_residual = torch.norm(residual, dim=-1)
+
+        # 2.
+        feature_acts_dead_neurons_only = torch.exp(hidden_pre[:, dead_neuron_mask])
+        ghost_out = feature_acts_dead_neurons_only @ self.W_dec[dead_neuron_mask, :]
+        l2_norm_ghost_out = torch.norm(ghost_out, dim=-1)
+        norm_scaling_factor = l2_norm_residual / (1e-6 + l2_norm_ghost_out * 2)
+        ghost_out = ghost_out * norm_scaling_factor[:, None].detach()
+
+        # 3.
+        mse_loss_ghost_resid = torch.pow((ghost_out - residual.detach().float()), 2)
+        
+        if self.cfg.mse_loss_normalization == "variance":
+            residual_centred = residual - residual.mean(dim=0, keepdim=True)
+            mse_loss_ghost_resid = mse_loss_ghost_resid / (residual_centred.detach() ** 2).sum(dim=-1, keepdim=True).sqrt()
+        
+        mse_rescaling_factor = (mse_loss / (mse_loss_ghost_resid + 1e-6)).detach()
+        mse_loss_ghost_resid = mse_rescaling_factor * mse_loss_ghost_resid
+
+        mse_loss_ghost_resid = mse_loss_ghost_resid.mean()
+        return mse_loss_ghost_resid
+
 
     @torch.no_grad()
     def initialize_b_dec(self, activation_store):
@@ -180,10 +245,8 @@ class SparseAutoencoder(HookedRootModule):
         distances = torch.norm(all_activations - out, dim=-1)
 
         print("Reinitializing b_dec with mean of activations")
-        print(
-            f"Previous distances: {previous_distances.median(0).values.mean().item()}"
-        )
-        print(f"New distances: {distances.median(0).values.mean().item()}")
+        print(f"Previous distances: {previous_distances.to(torch.float32).median(0).values.mean().item()}")
+        print(f"New distances: {distances.to(torch.float32).median(0).values.mean().item()}")
 
         self.b_dec.data = out.to(self.dtype).to(self.device)
 

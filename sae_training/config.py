@@ -32,6 +32,7 @@ class RunnerConfig(ABC):
     # Activation Store Parameters
     n_batches_in_buffer: int = 20
     total_training_tokens: int = 2_000_000
+    fine_tune_tokens: int = 0
     store_batch_size: int = (32,)
 
     # Misc
@@ -55,18 +56,23 @@ class LanguageModelSAERunnerConfig(RunnerConfig):
 
     # SAE Parameters
     b_dec_init_method: str = "geometric_median"
+    use_pre_encoder_bias: bool = True
     expansion_factor: int = 4
     from_pretrained_path: Optional[str] = None
 
     # Training Parameters
+    normalize_activations: bool = False, # if True, we normalize l2 Norm equal to sqrt(d_in)
+    mse_loss_normalization: str = None,  # None, "variance" 
     l1_coefficient: float = 1e-3
     lr: float = 3e-4
     lr_scheduler_name: str = "constantwithwarmup"  # constant, constantwithwarmup, linearwarmupdecay, cosineannealing, cosineannealingwarmup
     lr_warm_up_steps: int = 500
     train_batch_size: int = 4096
-
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    finetuning_method: str = "decoder" # scale, decoder or unrotated_decoder
     # Resampling protocol args
-    use_ghost_grads: bool = False  # want to change this to true on some timeline.
+    ghost_grads: Optional[str] = "residual"  # residual or activations
     feature_sampling_window: int = 2000
     dead_feature_window: int = 1000  # unless this window is larger feature sampling,
 
@@ -134,8 +140,8 @@ class LanguageModelSAERunnerConfig(RunnerConfig):
             f"n_tokens_per_dead_feature_window (millions): {(self.dead_feature_window * self.context_size * self.train_batch_size) / 10 **6}"
         )
 
-        if self.use_ghost_grads:
-            print("Using Ghost Grads.")
+        if self.ghost_grads is not None:
+            print("Using Ghost Grads: ", self.ghost_grads)
 
         print(
             f"We will reset the sparsity calculation {n_feature_window_samples} times."
@@ -145,6 +151,8 @@ class LanguageModelSAERunnerConfig(RunnerConfig):
             f"Number tokens in sparsity calculation window: {self.feature_sampling_window * self.train_batch_size:.2e}"
         )
 
+        if self.finetuning_method is None:
+            assert self.fine_tune_tokens == 0, "You must set finetuning_method if you want to fine-tune"
 
 @dataclass
 class CacheActivationsRunnerConfig(RunnerConfig):

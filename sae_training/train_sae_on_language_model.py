@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from torch.optim import Adam
 from tqdm import tqdm
@@ -9,6 +10,11 @@ from sae_training.evals import run_evals
 from sae_training.optim import get_scheduler
 from sae_training.sparse_autoencoder import SparseAutoencoder
 
+finetuning_parameters = {
+    "scale": ["scaling_factor"],
+    "decoder": ["scaling_factor", "W_dec", "b_dec"],
+    "unrotated_decoder": ["scaling_factor", "b_dec"],
+}
 
 def train_sae_on_language_model(
     model: HookedTransformer,
@@ -22,10 +28,12 @@ def train_sae_on_language_model(
     wandb_log_frequency: int = 50,
 ):
     total_training_tokens = sparse_autoencoder.cfg.total_training_tokens
-    total_training_steps = total_training_tokens // batch_size
+    fine_tune_tokens = sparse_autoencoder.cfg.fine_tune_tokens
+    total_training_steps = (total_training_tokens + fine_tune_tokens) // batch_size
     n_training_steps = 0
     n_training_tokens = 0
-
+    started_fine_tuning = False
+    
     if n_checkpoints > 0:
         checkpoint_thresholds = list(
             range(0, total_training_tokens, total_training_tokens // n_checkpoints)
@@ -40,7 +48,12 @@ def train_sae_on_language_model(
     )
     n_frac_active_tokens = 0
 
-    optimizer = Adam(sparse_autoencoder.parameters(), lr=sparse_autoencoder.cfg.lr)
+    trainable_parameters = [v for k, v in sparse_autoencoder.named_parameters() if "scaling_factor" not in k]
+    optimizer = Adam(
+        trainable_parameters,
+        lr=sparse_autoencoder.cfg.lr,
+        betas=(sparse_autoencoder.cfg.adam_beta1, sparse_autoencoder.cfg.adam_beta2),
+    )
     scheduler = get_scheduler(
         sparse_autoencoder.cfg.lr_scheduler_name,
         optimizer=optimizer,
@@ -48,15 +61,23 @@ def train_sae_on_language_model(
         training_steps=total_training_steps,
         lr_end=sparse_autoencoder.cfg.lr / 10,  # heuristic for now.
     )
+    
     sparse_autoencoder.initialize_b_dec(activation_store)
     sparse_autoencoder.train()
 
-    pbar = tqdm(total=total_training_tokens, desc="Training SAE")
-    while n_training_tokens < total_training_tokens:
+    pbar = tqdm(total=total_training_tokens + sparse_autoencoder.cfg.fine_tune_tokens, desc="Training SAE")
+    while n_training_tokens < total_training_tokens + sparse_autoencoder.cfg.fine_tune_tokens:
+        
+        if sparse_autoencoder.cfg.fine_tune_tokens > 0 and n_training_tokens > total_training_tokens and not started_fine_tuning:
+            fine_tune_params = [v for k, v in sparse_autoencoder.named_parameters() if k in finetuning_parameters[sparse_autoencoder.cfg.finetuning_method]]
+            optimizer = Adam(fine_tune_params, lr=sparse_autoencoder.cfg.lr, betas=(sparse_autoencoder.cfg.adam_beta1, sparse_autoencoder.cfg.adam_beta2))
+            started_fine_tuning = True
+        
         # Do a training step.
         sparse_autoencoder.train()
         # Make sure the W_dec is still zero-norm
-        sparse_autoencoder.set_decoder_norm_to_unit_norm()
+        if not started_fine_tuning:
+            sparse_autoencoder.set_decoder_norm_to_unit_norm()
 
         # log and then reset the feature sparsity every feature_sampling_window steps
         if (n_training_steps + 1) % feature_sampling_window == 0:
@@ -117,6 +138,11 @@ def train_sae_on_language_model(
                 l0 = (feature_acts > 0).float().sum(-1).mean()
                 current_learning_rate = optimizer.param_groups[0]["lr"]
 
+                if sparse_autoencoder.cfg.normalize_activations:
+                    sae_in = (
+                        sae_in / (1e-6 + sae_in.norm(dim=-1, keepdim=True))
+                    ) * np.sqrt(sparse_autoencoder.cfg.d_in)
+
                 per_token_l2_loss = (sae_out - sae_in).pow(2).sum(dim=-1).squeeze()
                 total_variance = (sae_in - sae_in.mean(0)).pow(2).sum(-1)
                 explained_variance = 1 - per_token_l2_loss / total_variance
@@ -153,8 +179,16 @@ def train_sae_on_language_model(
             )
             pbar.update(batch_size)
 
+
+        # if "cuda" in str(model.cfg.device):
+        #     scaler.scale(loss).backward()
+        #     sparse_autoencoder.remove_gradient_parallel_to_decoder_directions()
+        #     scaler.step(optimizer)
+        #     scaler.update()
+        # else:
         loss.backward()
-        sparse_autoencoder.remove_gradient_parallel_to_decoder_directions()
+        if not started_fine_tuning:
+            sparse_autoencoder.remove_gradient_parallel_to_decoder_directions()
         optimizer.step()
 
         # checkpoint if at checkpoint frequency
@@ -201,6 +235,7 @@ def train_sae_on_language_model(
         model_artifact.add_file(path)
         wandb.log_artifact(model_artifact, aliases=["final_model"])
 
+    log_feature_sparsity = torch.log10(feature_sparsity + 1e-10).detach().cpu()
     log_feature_sparsity_path = f"{sparse_autoencoder.cfg.checkpoint_path}/final_{sparse_autoencoder.get_name()}_log_feature_sparsity.pt"
     torch.save(log_feature_sparsity, log_feature_sparsity_path)
     if sparse_autoencoder.cfg.log_to_wandb:

@@ -28,7 +28,10 @@ def cfg():
     mock_config.is_dataset_tokenized = False
     mock_config.use_cached_activations = False
     mock_config.d_in = 64
-    mock_config.use_ghost_grads = False
+    mock_config.ghost_grads = None
+    mock_config.normalize_activations = None 
+    mock_config.mse_loss_normalization = None
+    mock_config.use_pre_encoder_bias = False
     mock_config.expansion_factor = 2
     mock_config.d_sae = mock_config.d_in * mock_config.expansion_factor
     mock_config.l1_coefficient = 2e-3
@@ -172,9 +175,9 @@ def test_load_from_pretrained_pkl_gz(cfg):
         # check state_dict matches the original
         for key in sparse_autoencoder.state_dict().keys():
             assert torch.allclose(
-                sparse_autoencoder_state_dict[
+                sparse_autoencoder_state_dict[  # pylint: disable=unsubscriptable-object
                     key
-                ],  # pylint: disable=unsubscriptable-object
+                ], 
                 sparse_autoencoder_loaded_state_dict[
                     key
                 ],  # pylint: disable=unsubscriptable-object
@@ -186,6 +189,7 @@ def test_sparse_autoencoder_forward(sparse_autoencoder):
     d_in = sparse_autoencoder.d_in
     d_sae = sparse_autoencoder.d_sae
 
+    sparse_autoencoder.eval()
     x = torch.randn(batch_size, d_in)
     (
         sae_out,
@@ -203,13 +207,9 @@ def test_sparse_autoencoder_forward(sparse_autoencoder):
     assert loss.shape == ()
     assert mse_loss.shape == ()
     assert l1_loss.shape == ()
-    assert torch.allclose(loss, mse_loss + l1_loss)
+    assert torch.allclose(loss, mse_loss + l1_loss + ghost_grad_loss)
 
-    x_centred = x - x.mean(dim=0, keepdim=True)
-    expected_mse_loss = (
-        torch.pow((sae_out - x.float()), 2)
-        / (x_centred**2).sum(dim=-1, keepdim=True).sqrt()
-    ).mean()
+    expected_mse_loss = torch.pow((sae_out - x.float()), 2).mean()
     assert torch.allclose(mse_loss, expected_mse_loss)
     expected_l1_loss = torch.abs(feature_acts).sum(dim=1).mean(dim=(0,))
     assert torch.allclose(l1_loss, sparse_autoencoder.l1_coefficient * expected_l1_loss)
