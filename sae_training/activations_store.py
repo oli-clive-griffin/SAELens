@@ -27,10 +27,12 @@ class ActivationsStore:
         # check if it's tokenized
         if "tokens" in next(self.iterable_dataset).keys():
             self.cfg.is_dataset_tokenized = True
-            print("Dataset is tokenized! Updating config.")
+            self.tokens_column = "tokens"
+        elif "input_ids" in next(self.iterable_dataset).keys():
+            self.cfg.is_dataset_tokenized = True
+            self.tokens_column = "input_ids"
         elif "text" in next(self.iterable_dataset).keys():
             self.cfg.is_dataset_tokenized = False
-            print("Dataset is not tokenized! Updating config.")
 
         if self.cfg.use_cached_activations:
             # Sanity check: does the cache directory exist?
@@ -89,7 +91,7 @@ class ActivationsStore:
                 ), f"tokens.shape should be 1D but was {tokens.shape}"
             else:
                 tokens = torch.tensor(
-                    next(self.iterable_dataset)["tokens"],
+                    next(self.iterable_dataset)[self.tokens_column],
                     dtype=torch.long,
                     device=device,
                     requires_grad=False,
