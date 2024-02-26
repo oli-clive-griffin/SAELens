@@ -64,10 +64,11 @@ class SparseAutoencoder(HookedRootModule):
             torch.zeros(self.d_in, dtype=self.dtype, device=self.device)
         )
 
-        # scaling factor for fine-tuning (not to be used in initial training)
-        self.scaling_factor = nn.Parameter(
-            torch.ones(self.d_sae, dtype=self.dtype, device=self.device)
-        )
+        if self.cfg.finetuning_method is not None:
+            # scaling factor for fine-tuning (not to be used in initial training)
+            self.scaling_factor = nn.Parameter(
+                torch.ones(self.d_sae, dtype=self.dtype, device=self.device)
+            )
 
 
         self.hook_sae_in = HookPoint()
