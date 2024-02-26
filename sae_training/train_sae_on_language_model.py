@@ -151,8 +151,7 @@ def train_sae_on_language_model(
                     {
                         # losses
                         "losses/mse_loss": mse_loss.item(),
-                        "losses/l1_loss": l1_loss.item()
-                        / sparse_autoencoder.l1_coefficient,  # normalize by l1 coefficient
+                        "losses/l1_loss": l1_loss.item() / sparse_autoencoder.l1_coefficient,  # normalize by l1 coefficient
                         "losses/ghost_grad_loss": ghost_grad_loss.item(),
                         "losses/overall_loss": loss.item(),
                         # variance explained
