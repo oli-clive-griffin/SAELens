@@ -70,7 +70,7 @@ class LanguageModelSAERunnerConfig(RunnerConfig):
     train_batch_size: int = 4096
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
-    finetuning_method: str = "decoder" # scale, decoder or unrotated_decoder
+    finetuning_method: Optional[str] = None # scale, decoder or unrotated_decoder
     # Resampling protocol args
     ghost_grads: Optional[str] = "residual"  # residual or activations
     feature_sampling_window: int = 2000
