@@ -17,6 +17,9 @@ def run_evals(
     model: HookedTransformer,
     n_training_steps: int,
 ):
+    
+    metrics = {}
+    
     hook_point = sparse_autoencoder.cfg.hook_point
     hook_point_layer = sparse_autoencoder.cfg.hook_point_layer
     hook_point_head_index = sparse_autoencoder.cfg.hook_point_head_index
@@ -61,8 +64,8 @@ def run_evals(
         l2_norm_in = torch.norm(original_act, dim=-1)
     l2_norm_out = torch.norm(sae_out, dim=-1)
     l2_norm_ratio = l2_norm_out / l2_norm_in
-
-    wandb.log(
+    
+    metrics.update(
         {
             # l2 norms
             "metrics/l2_norm": l2_norm_out.mean().item(),
@@ -72,8 +75,7 @@ def run_evals(
             "metrics/ce_loss_without_sae": ntp_loss,
             "metrics/ce_loss_with_sae": recons_loss,
             "metrics/ce_loss_with_ablation": zero_abl_loss,
-        },
-        step=n_training_steps,
+        }
     )
 
     head_index = sparse_autoencoder.cfg.hook_point_head_index
@@ -133,13 +135,17 @@ def run_evals(
         )
         kl_result_ablation = kl_result_ablation.sum(dim=-1).numpy()
 
-        wandb.log(
+        metrics.update(
             {
                 "metrics/kldiv_reconstructed": kl_result_reconstructed.mean().item(),
                 "metrics/kldiv_ablation": kl_result_ablation.mean().item(),
-            },
-            step=n_training_steps,
+            }
         )
+    # if we are in a wandb run, log the results
+    
+    if wandb.run is not None:
+        wandb.log(metrics, step=n_training_steps)
+    return metrics
 
 
 @torch.no_grad()
