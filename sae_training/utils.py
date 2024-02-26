@@ -96,8 +96,8 @@ def shuffle_activations_pairwise(datapath: str, buffer_idx_range: Tuple[int, int
         buffer_idx_range[0] < buffer_idx_range[1]
     ), "buffer_idx_range[0] must be smaller than buffer_idx_range[1]"
 
-    buffer_idx1 = torch.randint(buffer_idx_range[0], buffer_idx_range[1], (1,)).item()
-    buffer_idx2 = torch.randint(buffer_idx_range[0], buffer_idx_range[1], (1,)).item()
+    buffer_idx1 = torch.randint(buffer_idx_range[0], buffer_idx_range[1]+1, (1,)).item()
+    buffer_idx2 = torch.randint(buffer_idx_range[0], buffer_idx_range[1]+1, (1,)).item()
     while buffer_idx1 == buffer_idx2:  # Make sure they're not the same
         buffer_idx2 = torch.randint(
             buffer_idx_range[0], buffer_idx_range[1], (1,)
