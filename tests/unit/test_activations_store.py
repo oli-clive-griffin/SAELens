@@ -139,7 +139,9 @@ def test_activations_score_get_next_batch(model, activation_store):
     assert batch.shape == (activation_store.cfg.store_batch_size, activation_store.cfg.context_size)
    
     if model.tokenizer.bos_token_id is not None:
-        assert batch[:, 0] == model.tokenizer.bos_token_id
+        torch.testing.assert_close(
+            batch[:, 0], 
+            torch.ones_like(batch[:, 0])*model.tokenizer.bos_token_id)
 
 def test_activations_store__get_activations(activation_store):
     batch = activation_store.get_batch_tokens()
