@@ -309,7 +309,7 @@ class SparseAutoencoder(HookedRootModule):
 
         # ensure W_dec norms at unit norm
         self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True)
-        self.W_dec.data *= 0.1  # will break tests but do this for now.
+        self.W_dec.data *= norm  # will break tests but do this for now.
 
     @torch.no_grad()
     def remove_gradient_parallel_to_decoder_directions(self):
