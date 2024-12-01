@@ -509,7 +509,7 @@ class SAE(HookedRootModule):
             self.b_enc.data = self.b_enc.data * W_dec_norms.squeeze()
 
     @torch.no_grad()
-    def fold_activation_norm_scaling_factor(
+    def fold_activation_norm_scaling_factor_into_weights(
         self, activation_norm_scaling_factor: float
     ):
         self.W_enc.data = self.W_enc.data * activation_norm_scaling_factor
@@ -672,7 +672,9 @@ class SAE(HookedRootModule):
         if cfg_dict.get("normalize_activations") == "expected_average_only_in":
             norm_scaling_factor = get_norm_scaling_factor(release, sae_id)
             if norm_scaling_factor is not None:
-                sae.fold_activation_norm_scaling_factor(norm_scaling_factor)
+                sae.fold_activation_norm_scaling_factor_into_weights(
+                    norm_scaling_factor
+                )
                 cfg_dict["normalize_activations"] = "none"
             else:
                 warnings.warn(

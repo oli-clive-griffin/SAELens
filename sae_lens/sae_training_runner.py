@@ -68,12 +68,15 @@ class SAETrainingRunner:
                     self.cfg.from_pretrained_path, self.cfg.device
                 )
             else:
+                layer_acts = self.activations_store.storage_buffer.detach()[
+                    :, 0, :
+                ]  # TODO(oli-clive-griffin): is this a bug? I __think__ 0 means the first layer.
                 self.sae = TrainingSAE(
                     TrainingSAEConfig.from_dict(
                         self.cfg.get_training_sae_cfg_dict(),
-                    )
+                    ),
+                    layer_activations=layer_acts,
                 )
-                self._init_sae_group_b_decs()
         else:
             self.sae = override_sae
 
@@ -174,7 +177,7 @@ class SAETrainingRunner:
             median = compute_geometric_median(
                 layer_acts,
                 maxiter=100,
-            ).median
+            )
             self.sae.initialize_b_dec_with_precalculated(median)  # type: ignore
         elif self.cfg.b_dec_init_method == "mean":
             layer_acts = self.activations_store.storage_buffer.detach().cpu()[:, 0, :]

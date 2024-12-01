@@ -436,6 +436,7 @@ class LanguageModelSAERunnerConfig:
             "jumprelu_init_threshold": self.jumprelu_init_threshold,
             "jumprelu_bandwidth": self.jumprelu_bandwidth,
             "scale_sparsity_penalty_by_decoder_norm": self.scale_sparsity_penalty_by_decoder_norm,
+            "b_dec_init_method": self.b_dec_init_method,
         }
 
     def to_dict(self) -> dict[str, Any]:
