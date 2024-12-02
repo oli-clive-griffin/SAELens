@@ -4,18 +4,16 @@ import contextlib
 import json
 import os
 import warnings
-from pathlib import Path
 from typing import Any, Generator, Iterator, Literal, cast
 
 import datasets
-import numpy as np
 import torch
 from datasets import Dataset, DatasetDict, IterableDataset, load_dataset
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError
 from jaxtyping import Float
 from requests import HTTPError
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset as TorchDataset
 from tqdm import tqdm
 from transformer_lens.hook_points import HookedRootModule
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
@@ -33,6 +31,18 @@ from sae_lens.tokenization_and_batching import concat_and_batch_sequences
 
 ACTIVATION_STORE_STATE_FILENAME = "activation_store_state.json"
 
+class SingleTensorDataset(TorchDataset[torch.Tensor]):
+    """Very simple dataset wrapping a single tensor."""
+    def __init__(self, tensor: torch.Tensor) -> None:
+        self.tensor = tensor
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        return self.tensor[index]
+
+    def __len__(self) -> int:
+        return self.tensor.size(0)
+
+
 
 # TODO: Make an activation store config class to be consistent with the rest of the code.
 class ActivationsStore:
@@ -46,7 +56,6 @@ class ActivationsStore:
     cached_activations_path: str | None
     cached_activation_dataset: Dataset | None = None
     normalize_activations: ActivationNormalizationStrategy
-    estimated_norm_scaling_factor: float | None
     tokens_column: Literal["tokens", "input_ids", "text", "problem"]
     hook_name: str
     hook_layer: int
@@ -239,8 +248,6 @@ class ActivationsStore:
 
         self.n_dataset_processed = 0
 
-        self.estimated_norm_scaling_factor = None
-
         # Check if dataset is tokenized
         dataset_sample = next(iter(self.dataset))
 
@@ -298,12 +305,6 @@ class ActivationsStore:
         self._dataloader = None
 
         # TODO add support for "mixed loading" (ie use cache until you run out, then switch over to streaming from HF)
-
-    @torch.no_grad()
-    def set_norm_scaling_factor_if_needed(self) -> None:
-        """If needed, update the estimated norm scaling factor."""
-        if self.normalize_activations == "expected_average_only_in":
-            self.estimated_norm_scaling_factor = self.estimate_norm_scaling_factor()
 
     def _iterate_raw_dataset(
         self,
@@ -409,49 +410,6 @@ class ActivationsStore:
 
         return activations_dataset
 
-    def apply_norm_scaling_factor_if_needed(
-        self, activations: torch.Tensor
-    ) -> torch.Tensor:
-        if self.normalize_activations == "expected_average_only_in":
-            if self.estimated_norm_scaling_factor is None:
-                raise ValueError(
-                    "Norm scaling factor is None, but normalize_activations is expected_average_only_in, "
-                    "please call estimate_norm_scaling_factor_if_needed first."
-                )
-            return activations * self.estimated_norm_scaling_factor
-        return activations
-
-    def unapply_norm_scaling_factor_if_needed(
-        self, activations: torch.Tensor
-    ) -> torch.Tensor:
-        if self.normalize_activations == "expected_average_only_in":
-            if self.estimated_norm_scaling_factor is None:
-                raise ValueError(
-                    "Norm scaling factor is None, but normalize_activations is expected_average_only_in, "
-                    "please call estimate_norm_scaling_factor_if_needed first."
-                )
-            return activations / self.estimated_norm_scaling_factor
-        return activations
-
-    def get_norm_scaling_factor(self, activations: torch.Tensor) -> torch.Tensor:
-        return (self.d_in**0.5) / activations.norm(dim=-1).mean()
-
-    @torch.no_grad()
-    def estimate_norm_scaling_factor(self, n_batches_for_norm_estimate: int = int(1e3)):
-        norms_per_batch = []
-        for _ in tqdm(
-            range(n_batches_for_norm_estimate), desc="Estimating norm scaling factor"
-        ):
-            # temporarily set the scaling factor to so that we can load a batch without erroring
-            self.estimated_norm_scaling_factor = 1.0
-            acts = self.next_batch()
-            self.estimated_norm_scaling_factor = None
-
-            norms_per_batch.append(acts.norm(dim=-1).mean().item())
-        mean_norm = np.mean(norms_per_batch)
-        scaling_factor = np.sqrt(self.d_in) / mean_norm
-
-        return scaling_factor
 
     def shuffle_input_dataset(self, seed: int, buffer_size: int = 1):
         """
@@ -481,7 +439,7 @@ class ActivationsStore:
         return self._storage_buffer
 
     @property
-    def dataloader(self) -> Iterator[Any]:
+    def dataloader(self) -> Iterator[torch.Tensor]:
         if self._dataloader is None:
             self._dataloader = self.get_data_loader()
         return self._dataloader
@@ -663,14 +621,9 @@ class ActivationsStore:
         if shuffle:
             new_buffer = new_buffer[torch.randperm(new_buffer.shape[0])]
 
-        # every buffer should be normalized:
-        new_buffer = self.apply_norm_scaling_factor_if_needed(new_buffer)
-
         return new_buffer
 
-    def get_data_loader(
-        self,
-    ) -> Iterator[Any]:
+    def get_data_loader(self) -> Iterator[torch.Tensor]:
         """
         Return a torch.utils.dataloader which you can get batches from.
 
@@ -711,18 +664,17 @@ class ActivationsStore:
         self._storage_buffer = mixing_buffer[: mixing_buffer.shape[0] // 2]
 
         # 3. put other 50 % in a dataloader
-        dataloader = iter(
-            DataLoader(
-                # TODO: seems like a typing bug?
-                cast(Any, mixing_buffer[mixing_buffer.shape[0] // 2 :]),
-                batch_size=batch_size,
-                shuffle=True,
-            )
+        dataset = SingleTensorDataset(mixing_buffer[mixing_buffer.shape[0] // 2 :])
+
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
         )
 
-        return dataloader
+        return iter(dataloader)
 
-    def next_batch(self):
+    def next_batch(self) -> torch.Tensor:
         """
         Get the next batch from the current DataLoader.
         If the DataLoader is exhausted, refill the buffer and create a new DataLoader.
@@ -734,14 +686,6 @@ class ActivationsStore:
             # If the DataLoader is exhausted, create a new one
             self._dataloader = self.get_data_loader()
             return next(self.dataloader)
-
-    def save_state(self, path: Path):
-        state = {
-            "norm_scaling_factor": self.estimated_norm_scaling_factor,
-        }
-
-        with open(path / ACTIVATION_STORE_STATE_FILENAME, "w") as f:
-            json.dump(state, f)
 
 
 def validate_pretokenized_dataset_tokenizer(

@@ -233,11 +233,31 @@ class SAE(HookedRootModule):
 
             self.run_time_activation_norm_fn_in = run_time_activation_ln_in
             self.run_time_activation_norm_fn_out = run_time_activation_ln_out
-        else:
-            self.run_time_activation_norm_fn_in = lambda x: x
+
+        elif self.cfg.normalize_activations == "expected_average_only_in":
+            # only apply the scaling factor to the input
+            self.run_time_activation_norm_fn_in = self.apply_norm_scaling_factor
             self.run_time_activation_norm_fn_out = lambda x: x
+        # init as None so that we know if we accidentally use it without setting it first
+        self.norm_scaling_factor: Optional[float] = None
 
         self.setup()  # Required for `HookedRootModule`s
+
+    def apply_norm_scaling_factor(self, x: torch.Tensor) -> torch.Tensor:
+        if self.norm_scaling_factor is None:
+            raise ValueError(
+                "Norm scaling factor is None, but normalize_activations is expected_average_only_in, "
+                "please call estimate_norm_scaling_factor_if_needed first."  # TODO(oli-clive-griffin): check this message
+            )
+        return self.norm_scaling_factor * x
+
+    def unapply_norm_scaling_factor(self, x: torch.Tensor) -> torch.Tensor:
+        if self.norm_scaling_factor is None:
+            raise ValueError(
+                "Norm scaling factor is None, but normalize_activations is expected_average_only_in, "
+                "please call estimate_norm_scaling_factor_if_needed first."  # TODO(oli-clive-griffin): check this message
+            )
+        return x / self.norm_scaling_factor
 
     def initialize_weights_basic(self):
 
@@ -512,6 +532,9 @@ class SAE(HookedRootModule):
         self.process_state_dict_for_saving(state_dict)
         model_weights_path = path / SAE_WEIGHTS_FILENAME
         save_file(state_dict, model_weights_path)
+
+        # save 
+        # save(self.norm_scaling_factor)
 
         # save the config
         config = self.cfg.to_dict()

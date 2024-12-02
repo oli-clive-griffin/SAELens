@@ -191,8 +191,6 @@ class SAETrainingRunner:
         base_path = Path(self.cfg.checkpoint_path) / checkpoint_name
         base_path.mkdir(exist_ok=True, parents=True)
 
-        self.activations_store.save_state(base_path)
-
         # TODO(oli-clive-griffin): Is this broken? it seems like this is "assymetrical" in the sense that
         # this changes the output of the SAE.
         # Should we not also balance this by scaling the encoder weights?
