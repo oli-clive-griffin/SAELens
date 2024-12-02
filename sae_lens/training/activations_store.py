@@ -13,7 +13,8 @@ from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError
 from jaxtyping import Float
 from requests import HTTPError
-from torch.utils.data import DataLoader, Dataset as TorchDataset
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset as TorchDataset
 from tqdm import tqdm
 from transformer_lens.hook_points import HookedRootModule
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
@@ -30,17 +31,6 @@ from sae_lens.sae import SAE
 from sae_lens.tokenization_and_batching import concat_and_batch_sequences
 
 ACTIVATION_STORE_STATE_FILENAME = "activation_store_state.json"
-
-class SingleTensorDataset(TorchDataset[torch.Tensor]):
-    """Very simple dataset wrapping a single tensor."""
-    def __init__(self, tensor: torch.Tensor) -> None:
-        self.tensor = tensor
-
-    def __getitem__(self, index: int) -> torch.Tensor:
-        return self.tensor[index]
-
-    def __len__(self) -> int:
-        return self.tensor.size(0)
 
 
 
@@ -410,7 +400,6 @@ class ActivationsStore:
 
         return activations_dataset
 
-
     def shuffle_input_dataset(self, seed: int, buffer_size: int = 1):
         """
         This applies a shuffle to the huggingface dataset that is the input to the activations store. This
@@ -664,8 +653,7 @@ class ActivationsStore:
         self._storage_buffer = mixing_buffer[: mixing_buffer.shape[0] // 2]
 
         # 3. put other 50 % in a dataloader
-        dataset = SingleTensorDataset(mixing_buffer[mixing_buffer.shape[0] // 2 :])
-
+        dataset = cast(TorchDataset[torch.Tensor], mixing_buffer[mixing_buffer.shape[0] // 2 :])
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,

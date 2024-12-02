@@ -191,7 +191,7 @@ class SAETrainer:
         )  # TODO(oli-clive-griffin): cursor is suggesting I change this to `self.activation_store.d_sae`. Check the literature
 
         return scaling_factor
-    
+
     def fit(self) -> TrainingSAE:
 
         pbar = tqdm(total=self.cfg.total_training_tokens, desc="Training SAE")
@@ -221,7 +221,6 @@ class SAETrainer:
             ### If n_training_tokens > sae_group.cfg.training_tokens, then we should switch to fine-tuning (if we haven't already)
             self._begin_finetuning_if_needed()
 
-        
         if estimated_norm_scaling_factor is not None:
             self.sae.fold_activation_norm_scaling_factor(estimated_norm_scaling_factor)
 
