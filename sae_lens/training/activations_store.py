@@ -51,8 +51,8 @@ class ActivationsStore:
     hook_name: str
     hook_layer: int
     hook_head_index: int | None
-    _dataloader: Iterator[Any] | None = None
-    _storage_buffer: torch.Tensor | None = None
+    _dataloader: Iterator[torch.Tensor] | None
+    _storage_buffer: torch.Tensor | None
     device: torch.device
 
     @classmethod
@@ -293,6 +293,9 @@ class ActivationsStore:
         self.iterable_sequences = self._iterate_tokenized_sequences()
 
         self.cached_activation_dataset = self.load_cached_activation_dataset()
+
+        self._storage_buffer = None
+        self._dataloader = None
 
         # TODO add support for "mixed loading" (ie use cache until you run out, then switch over to streaming from HF)
 
