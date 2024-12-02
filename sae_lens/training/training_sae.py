@@ -240,7 +240,6 @@ class TrainingSAE(SAE):
     def __init__(
         self,
         cfg: TrainingSAEConfig,
-        sample_activations: torch.Tensor,
         use_error_term: bool = False,
     ):
         base_sae_cfg = SAEConfig.from_dict(cfg.get_base_sae_cfg_dict())
@@ -273,10 +272,16 @@ class TrainingSAE(SAE):
 
         self.mse_loss_fn = self._get_mse_loss_fn()
 
-        self._init_b_decs(sample_activations)
-
     @torch.no_grad()
-    def _init_b_decs(self, layer_activations: torch.Tensor) -> None:
+    def init_b_decs(self, activations_buffer: torch.Tensor) -> None:
+        """Initialize the b_dec bias for the decoder based on the activations dataset.
+
+        :param activations_buffer: a buffer of activations from the dataset, shape (dataset_size, num_layers, d_model)
+        """
+        layer_activations = activations_buffer[
+            :, 0, :
+        ]  # TODO(oli-clive-griffin): is this a bug? I __think__ 0 means the first layer.
+
         if self.cfg.b_dec_init_method == "geometric_median":
             # get geometric median of the activations if we're using those.
             median = compute_geometric_median(layer_activations, maxiter=100)
