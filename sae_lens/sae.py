@@ -238,17 +238,20 @@ class SAE(HookedRootModule):
             self.run_time_activation_norm_fn_in = lambda x: x
             self.run_time_activation_norm_fn_out = lambda x: x
 
-        else:
+        elif self.cfg.normalize_activations == "expected_average_only_in":
             # only apply the scaling factor to the input
             self.run_time_activation_norm_fn_in = self.apply_norm_scaling_factor
             self.run_time_activation_norm_fn_out = lambda x: x
-
-        # set the norm scaling factor to None so that we know if we accidentally use it without setting it first
-        self.norm_scaling_factor: Optional[float] = None
+            # set the norm scaling factor to None so that we know if we accidentally use it without setting it first
+            self.norm_scaling_factor: Optional[float] = None
 
         self.setup()  # Required for `HookedRootModule`s
 
     def apply_norm_scaling_factor(self, x: torch.Tensor) -> torch.Tensor:
+        if self.cfg.normalize_activations != "expected_average_only_in":
+            raise ValueError(
+                "Norm scaling factor is only applied when normalize_activations is expected_average_only_in"
+            )
         if self.norm_scaling_factor is None:
             raise ValueError(
                 "Norm scaling factor is None, but normalize_activations is expected_average_only_in, "
@@ -257,6 +260,10 @@ class SAE(HookedRootModule):
         return self.norm_scaling_factor * x
 
     def unapply_norm_scaling_factor(self, x: torch.Tensor) -> torch.Tensor:
+        if self.cfg.normalize_activations != "expected_average_only_in":
+            raise ValueError(
+                "Norm scaling factor is only unapplied when normalize_activations is expected_average_only_in"
+            )
         if self.norm_scaling_factor is None:
             raise ValueError(
                 "Norm scaling factor is None, but normalize_activations is expected_average_only_in, "
