@@ -32,6 +32,7 @@ HfDataset = DatasetDict | Dataset | IterableDatasetDict | IterableDataset
 ActivationNormalizationStrategy = Literal[
     "none", "expected_average_only_in", "constant_norm_rescale", "layer_norm"
 ]
+
 DecoderBiasInitMethod = Literal["geometric_median", "mean", "zeros"]
 
 
