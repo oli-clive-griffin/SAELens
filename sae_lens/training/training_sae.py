@@ -237,11 +237,7 @@ class TrainingSAE(SAE):
     dtype: torch.dtype
     device: torch.device
 
-    def __init__(
-        self,
-        cfg: TrainingSAEConfig,
-        use_error_term: bool = False,
-    ):
+    def __init__(self, cfg: TrainingSAEConfig, use_error_term: bool = False):
         base_sae_cfg = SAEConfig.from_dict(cfg.get_base_sae_cfg_dict())
         super().__init__(base_sae_cfg)
         self.cfg = cfg  # type: ignore
