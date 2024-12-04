@@ -44,7 +44,7 @@ class ActivationsStore:
     model: HookedRootModule
     dataset: HfDataset
     cached_activations_path: str | None
-    cached_activation_dataset: Dataset | None = None
+    cached_activation_dataset: Dataset | None
     normalize_activations: ActivationNormalizationStrategy
     tokens_column: Literal["tokens", "input_ids", "text", "problem"]
     hook_name: str
@@ -408,7 +408,7 @@ class ActivationsStore:
         The default buffer_size of 1 means that only the shard will be shuffled; larger buffer sizes will
         additionally shuffle individual elements within the shard.
         """
-        if type(self.dataset) == IterableDataset:
+        if isinstance(self.dataset, IterableDataset):
             self.dataset = self.dataset.shuffle(seed=seed, buffer_size=buffer_size)
         else:
             self.dataset = self.dataset.shuffle(seed=seed)
