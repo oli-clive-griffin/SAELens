@@ -29,6 +29,12 @@ DTYPE_MAP = {
 
 HfDataset = DatasetDict | Dataset | IterableDatasetDict | IterableDataset
 
+ActivationNormalizationStrategy = Literal[
+    "none", "expected_average_only_in", "constant_norm_rescale", "layer_norm"
+]
+
+DecoderBiasInitMethod = Literal["geometric_median", "mean", "zeros"]
+
 
 @dataclass
 class LanguageModelSAERunnerConfig:
@@ -42,7 +48,7 @@ class LanguageModelSAERunnerConfig:
         hook_name (str): The name of the hook to use. This should be a valid TransformerLens hook.
         hook_eval (str): NOT CURRENTLY IN USE. The name of the hook to use for evaluation.
         hook_layer (int): The index of the layer to hook. Used to stop forward passes early and speed up processing.
-        hook_head_index (int, optional): When the hook if for an activatio with a head index, we can specify a specific head to use here.
+        hook_head_index (int, optional): When the hook is for an activation with a head index, we can specify a specific head to use here.
         dataset_path (str): A Hugging Face dataset path.
         dataset_trust_remote_code (bool): Whether to trust remote code when loading datasets from Huggingface.
         streaming (bool): Whether to stream the dataset. Streaming large datasets is usually practical.
@@ -52,7 +58,7 @@ class LanguageModelSAERunnerConfig:
         cached_activations_path (str, optional): The path to the cached activations.
         d_in (int): The input dimension of the SAE.
         d_sae (int, optional): The output dimension of the SAE. If None, defaults to `d_in * expansion_factor`.
-        b_dec_init_method (str): The method to use to initialize the decoder bias. Zeros is likely fine.
+        b_dec_init_method (DecoderBiasInitMethod): The method to use to initialize the decoder bias. Zeros is likely fine.
         expansion_factor (int): The expansion factor. Larger is better but more computationally expensive. Default is 4.
         activation_fn (str): The activation function to use. Relu is standard.
         normalize_sae_decoder (bool): Whether to normalize the SAE decoder. Unit normed decoder weights used to be preferred.
@@ -60,14 +66,14 @@ class LanguageModelSAERunnerConfig:
         from_pretrained_path (str, optional): The path to a pretrained SAE. We can finetune an existing SAE if needed.
         apply_b_dec_to_input (bool): Whether to apply the decoder bias to the input. Not currently advised.
         decoder_orthogonal_init (bool): Whether to use orthogonal initialization for the decoder. Not currently advised.
-        decoder_heuristic_init (bool): Whether to use heuristic initialization for the decoder. See Anthropic April Update.
-        init_encoder_as_decoder_transpose (bool): Whether to initialize the encoder as the transpose of the decoder. See Anthropic April Update.
+        decoder_heuristic_init (bool): Whether to use heuristic initialization for the decoder. See Anthropic April 2024 Update.
+        init_encoder_as_decoder_transpose (bool): Whether to initialize the encoder as the transpose of the decoder. See Anthropic April 2024 Update.
         n_batches_in_buffer (int): The number of batches in the buffer. When not using cached activations, a buffer in ram is used. The larger it is, the better shuffled the activations will be.
         training_tokens (int): The number of training tokens.
         finetuning_tokens (int): The number of finetuning tokens. See [here](https://www.lesswrong.com/posts/3JuSjTZyMzaSeTxKk/addressing-feature-suppression-in-saes)
         store_batch_size_prompts (int): The batch size for storing activations. This controls how many prompts are in the batch of the language model when generating actiations.
         train_batch_size_tokens (int): The batch size for training. This controls the batch size of the SAE Training loop.
-        normalize_activations (str): Activation Normalization Strategy. Either none, expected_average_only_in (estimate the average activation norm and divide activations by it following Antrhopic April update -> this can be folded post training and set to None), or constant_norm_rescale (at runtime set activation norm to sqrt(d_in) and then scale up the SAE output).
+        normalize_activations (ActivationNormalizationStrategy): Activation Normalization Strategy. Either none, expected_average_only_in (estimate the average activation norm and divide activations by it following Anthropic April 2024 update -> this can be folded post training and set to None), or constant_norm_rescale (at runtime set activation norm to sqrt(d_in) and then scale up the SAE output).
         seqpos_slice (tuple): Determines slicing of activations when constructing batches during training. The slice should be (start_pos, end_pos, optional[step_size]), e.g. for Othello we sometimes use (5, -5). Note, step_size > 0.
         device (str): The device to use. Usually cuda.
         act_store_device (str): The device to use for the activation store. CPU is advised in order to save vram.
@@ -140,7 +146,7 @@ class LanguageModelSAERunnerConfig:
     architecture: Literal["standard", "gated", "jumprelu", "topk"] = "standard"
     d_in: int = 512
     d_sae: Optional[int] = None
-    b_dec_init_method: str = "geometric_median"
+    b_dec_init_method: DecoderBiasInitMethod = "geometric_median"
     expansion_factor: Optional[int] = (
         None  # defaults to 4 if d_sae and expansion_factor is None
     )
@@ -160,7 +166,7 @@ class LanguageModelSAERunnerConfig:
     finetuning_tokens: int = 0
     store_batch_size_prompts: int = 32
     train_batch_size_tokens: int = 4096
-    normalize_activations: str = "none"  # none, expected_average_only_in (Anthropic April Update), constant_norm_rescale (Anthropic Feb Update)
+    normalize_activations: ActivationNormalizationStrategy = "none"
     seqpos_slice: tuple[int | None, ...] = (None,)
 
     # Misc
@@ -295,11 +301,6 @@ class LanguageModelSAERunnerConfig:
             else:
                 self.model_from_pretrained_kwargs = {}
 
-        if self.b_dec_init_method not in ["geometric_median", "mean", "zeros"]:
-            raise ValueError(
-                f"b_dec_init_method must be geometric_median, mean, or zeros. Got {self.b_dec_init_method}"
-            )
-
         if self.normalize_sae_decoder and self.decoder_heuristic_init:
             raise ValueError(
                 "You can't normalize the decoder and use heuristic initialization."
@@ -314,16 +315,6 @@ class LanguageModelSAERunnerConfig:
         if (self.finetuning_method == "decoder") and (self.apply_b_dec_to_input):
             raise ValueError(
                 "If we are fine tuning the decoder, we can't be applying b_dec to the input.\nSet apply_b_dec_to_input to False."
-            )
-
-        if self.normalize_activations not in [
-            "none",
-            "expected_average_only_in",
-            "constant_norm_rescale",
-            "layer_norm",
-        ]:
-            raise ValueError(
-                f"normalize_activations must be none, layer_norm, expected_average_only_in, or constant_norm_rescale. Got {self.normalize_activations}"
             )
 
         if self.act_store_device == "with_model":
@@ -446,6 +437,7 @@ class LanguageModelSAERunnerConfig:
             "jumprelu_init_threshold": self.jumprelu_init_threshold,
             "jumprelu_bandwidth": self.jumprelu_bandwidth,
             "scale_sparsity_penalty_by_decoder_norm": self.scale_sparsity_penalty_by_decoder_norm,
+            "b_dec_init_method": self.b_dec_init_method,
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -636,7 +628,7 @@ class ToyModelSAERunnerConfig:
     l1_coefficient: float = 1e-3
     lr: float = 3e-4
     train_batch_size: int = 1024
-    b_dec_init_method: str = "geometric_median"
+    b_dec_init_method: DecoderBiasInitMethod = "geometric_median"
 
     # Sparsity / Dead Feature Handling
     use_ghost_grads: bool = (

@@ -17,7 +17,7 @@ from safetensors.torch import save_file
 from torch import nn
 from transformer_lens.hook_points import HookedRootModule, HookPoint
 
-from sae_lens.config import DTYPE_MAP
+from sae_lens.config import DTYPE_MAP, ActivationNormalizationStrategy
 from sae_lens.toolkit.pretrained_sae_loaders import (
     NAMED_PRETRAINED_SAE_LOADERS,
     get_conversion_loader_name,
@@ -57,7 +57,7 @@ class SAEConfig:
     prepend_bos: bool
     dataset_path: str
     dataset_trust_remote_code: bool
-    normalize_activations: str
+    normalize_activations: ActivationNormalizationStrategy
 
     # misc
     dtype: str
@@ -229,11 +229,43 @@ class SAE(HookedRootModule):
 
             self.run_time_activation_norm_fn_in = run_time_activation_ln_in
             self.run_time_activation_norm_fn_out = run_time_activation_ln_out
-        else:
+
+        elif self.cfg.normalize_activations == "none":
             self.run_time_activation_norm_fn_in = lambda x: x
             self.run_time_activation_norm_fn_out = lambda x: x
 
+        elif self.cfg.normalize_activations == "expected_average_only_in":
+            # only apply the scaling factor to the input
+            self.run_time_activation_norm_fn_in = self.apply_norm_scaling_factor
+            self.run_time_activation_norm_fn_out = lambda x: x
+            # set the norm scaling factor to None so that we know if we accidentally use it without setting it first
+            self.norm_scaling_factor: Optional[float] = None
+
         self.setup()  # Required for `HookedRootModule`s
+
+    def apply_norm_scaling_factor(self, x: torch.Tensor) -> torch.Tensor:
+        if self.cfg.normalize_activations != "expected_average_only_in":
+            raise ValueError(
+                "Norm scaling factor is only applied when normalize_activations is expected_average_only_in"
+            )
+        if self.norm_scaling_factor is None:
+            raise ValueError(
+                "Norm scaling factor is None, but normalize_activations is expected_average_only_in, "
+                "please call estimate_norm_scaling_factor_if_needed first."  # TODO(oli-clive-griffin): check this message
+            )
+        return self.norm_scaling_factor * x
+
+    def unapply_norm_scaling_factor(self, x: torch.Tensor) -> torch.Tensor:
+        if self.cfg.normalize_activations != "expected_average_only_in":
+            raise ValueError(
+                "Norm scaling factor is only unapplied when normalize_activations is expected_average_only_in"
+            )
+        if self.norm_scaling_factor is None:
+            raise ValueError(
+                "Norm scaling factor is None, but normalize_activations is expected_average_only_in, "
+                "please call estimate_norm_scaling_factor_if_needed first."  # TODO(oli-clive-griffin): check this message
+            )
+        return x / self.norm_scaling_factor
 
     def initialize_weights_basic(self):
         # no config changes encoder bias init for now.
@@ -470,11 +502,10 @@ class SAE(HookedRootModule):
             self.b_enc.data = self.b_enc.data * W_dec_norms.squeeze()
 
     @torch.no_grad()
-    def fold_activation_norm_scaling_factor(
+    def fold_activation_norm_scaling_factor_into_weights(
         self, activation_norm_scaling_factor: float
     ):
         self.W_enc.data = self.W_enc.data * activation_norm_scaling_factor
-        # previously weren't doing this.
         self.W_dec.data = self.W_dec.data / activation_norm_scaling_factor
         self.b_dec.data = self.b_dec.data / activation_norm_scaling_factor
 
@@ -500,6 +531,9 @@ class SAE(HookedRootModule):
         self.process_state_dict_for_saving(state_dict)
         model_weights_path = path / SAE_WEIGHTS_FILENAME
         save_file(state_dict, model_weights_path)
+
+        # save
+        # save(self.norm_scaling_factor)
 
         # save the config
         config = self.cfg.to_dict()
@@ -631,7 +665,9 @@ class SAE(HookedRootModule):
         if cfg_dict.get("normalize_activations") == "expected_average_only_in":
             norm_scaling_factor = get_norm_scaling_factor(release, sae_id)
             if norm_scaling_factor is not None:
-                sae.fold_activation_norm_scaling_factor(norm_scaling_factor)
+                sae.fold_activation_norm_scaling_factor_into_weights(
+                    norm_scaling_factor
+                )
                 cfg_dict["normalize_activations"] = "none"
             else:
                 warnings.warn(

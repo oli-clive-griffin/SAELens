@@ -1,7 +1,8 @@
 import contextlib
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, Optional, Protocol, cast
 
+import numpy as np
 import torch
 import wandb
 from torch.optim import Adam
@@ -36,6 +37,15 @@ def _update_sae_lens_training_version(sae: TrainingSAE) -> None:
     sae.cfg.sae_lens_training_version = str(__version__)
 
 
+class SaveCheckpointFn(Protocol):
+    def __call__(
+        self,
+        trainer: "SAETrainer",
+        checkpoint_name: str,
+        wandb_aliases: Optional[list[str]] = None,
+    ) -> None: ...
+
+
 @dataclass
 class TrainSAEOutput:
     sae: TrainingSAE
@@ -53,7 +63,7 @@ class SAETrainer:
         model: HookedRootModule,
         sae: TrainingSAE,
         activation_store: ActivationsStore,
-        save_checkpoint_fn,  # type: ignore
+        save_checkpoint_fn: SaveCheckpointFn,
         cfg: LanguageModelSAERunnerConfig,
     ) -> None:
         self.model = model
@@ -162,10 +172,33 @@ class SAETrainer:
     def dead_neurons(self) -> torch.Tensor:
         return (self.n_forward_passes_since_fired > self.cfg.dead_feature_window).bool()
 
+    @torch.no_grad()
+    def estimate_norm_scaling_factor(
+        self, n_batches_for_norm_estimate: int = int(1e3)
+    ) -> float:
+        norms_per_batch: list[float] = []
+        for _ in tqdm(
+            range(n_batches_for_norm_estimate), desc="Estimating norm scaling factor"
+        ):
+            # TODO(oli-clive-griffin): check there's no indexing needed here
+            # TODO(oli-clive-griffin): I think this is calculating across all layers, is that right? (OHHH, is `n_layers` expected to be 1?)
+            acts = self.activation_store.next_batch()
+            norms_per_batch.append(acts.norm(dim=-1).mean().item())
+        mean_norm = np.mean(norms_per_batch)
+        scaling_factor = (
+            np.sqrt(self.cfg.d_in) / mean_norm
+        )  # TODO(oli-clive-griffin): cursor is suggesting I change this to `self.activation_store.d_sae`. Check the literature
+
+        return scaling_factor
+
     def fit(self) -> TrainingSAE:
         pbar = tqdm(total=self.cfg.total_training_tokens, desc="Training SAE")
 
-        self.activation_store.set_norm_scaling_factor_if_needed()
+        estimated_norm_scaling_factor = (
+            self.estimate_norm_scaling_factor()
+            if self.cfg.normalize_activations == "expected_average_only_in"
+            else None
+        )
 
         # Train loop
         while self.n_training_tokens < self.cfg.total_training_tokens:
@@ -186,12 +219,8 @@ class SAETrainer:
             ### If n_training_tokens > sae_group.cfg.training_tokens, then we should switch to fine-tuning (if we haven't already)
             self._begin_finetuning_if_needed()
 
-        # fold the estimated norm scaling factor into the sae weights
-        if self.activation_store.estimated_norm_scaling_factor is not None:
-            self.sae.fold_activation_norm_scaling_factor(
-                self.activation_store.estimated_norm_scaling_factor
-            )
-            self.activation_store.estimated_norm_scaling_factor = None
+        if estimated_norm_scaling_factor is not None:
+            self.sae.fold_activation_norm_scaling_factor(estimated_norm_scaling_factor)
 
         # save final sae group to checkpoints folder
         self.save_checkpoint(
@@ -209,7 +238,7 @@ class SAETrainer:
         sae_in: torch.Tensor,
     ) -> TrainStepOutput:
         sae.train()
-        # Make sure the W_dec is still zero-norm
+        # Make sure the W_dec is still unit-norm
         if self.cfg.normalize_sae_decoder:
             sae.set_decoder_norm_to_unit_norm()
 
@@ -384,7 +413,7 @@ class SAETrainer:
         ):
             self.save_checkpoint(
                 trainer=self,
-                checkpoint_name=self.n_training_tokens,
+                checkpoint_name=str(self.n_training_tokens),
             )
             self.checkpoint_thresholds.pop(0)
 

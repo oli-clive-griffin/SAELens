@@ -13,17 +13,8 @@ from sae_lens import logger
 from sae_lens.config import HfDataset, LanguageModelSAERunnerConfig
 from sae_lens.load_model import load_model
 from sae_lens.training.activations_store import ActivationsStore
-from sae_lens.training.geometric_median import compute_geometric_median
 from sae_lens.training.sae_trainer import SAETrainer
 from sae_lens.training.training_sae import TrainingSAE, TrainingSAEConfig
-
-
-class InterruptedException(Exception):
-    pass
-
-
-def interrupt_callback(sig_num: Any, stack_frame: Any):  # noqa: ARG001
-    raise InterruptedException()
 
 
 class SAETrainingRunner:
@@ -79,9 +70,9 @@ class SAETrainingRunner:
                 self.sae = TrainingSAE(
                     TrainingSAEConfig.from_dict(
                         self.cfg.get_training_sae_cfg_dict(),
-                    )
+                    ),
                 )
-                self._init_sae_group_b_decs()
+                self.sae.init_b_decs(self.activations_store.storage_buffer.detach())
         else:
             self.sae = override_sae
 
@@ -141,6 +132,12 @@ class SAETrainingRunner:
             )  # type: ignore
 
     def run_trainer_with_interruption_handling(self, trainer: SAETrainer):
+        class InterruptedException(Exception):
+            pass
+
+        def interrupt_callback(sig_num: Any, stack_frame: Any):
+            raise InterruptedException()
+
         try:
             # signal handlers (if preempted)
             signal.signal(signal.SIGINT, interrupt_callback)
@@ -158,36 +155,16 @@ class SAETrainingRunner:
 
         return sae
 
-    # TODO: move this into the SAE trainer or Training SAE class
-    def _init_sae_group_b_decs(
-        self,
-    ) -> None:
-        """
-        extract all activations at a certain layer and use for sae b_dec initialization
-        """
-
-        if self.cfg.b_dec_init_method == "geometric_median":
-            layer_acts = self.activations_store.storage_buffer.detach()[:, 0, :]
-            # get geometric median of the activations if we're using those.
-            median = compute_geometric_median(
-                layer_acts,
-                maxiter=100,
-            ).median
-            self.sae.initialize_b_dec_with_precalculated(median)  # type: ignore
-        elif self.cfg.b_dec_init_method == "mean":
-            layer_acts = self.activations_store.storage_buffer.detach().cpu()[:, 0, :]
-            self.sae.initialize_b_dec_with_mean(layer_acts)  # type: ignore
-
     def save_checkpoint(
         self,
         trainer: SAETrainer,
         checkpoint_name: str,
         wandb_aliases: list[str] | None = None,
     ) -> None:
+        """Save a checkpoint of the SAE locally and optionally to wandb."""
+
         base_path = Path(self.cfg.checkpoint_path) / checkpoint_name
         base_path.mkdir(exist_ok=True, parents=True)
-
-        self.activations_store.save(str(base_path))
 
         if self.sae.cfg.normalize_sae_decoder:
             self.sae.set_decoder_norm_to_unit_norm()
