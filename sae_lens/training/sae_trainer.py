@@ -1,6 +1,8 @@
-import contextlib
+import contextlib  # noqa: I001
 from dataclasses import dataclass
-from typing import Any, Optional, Protocol, cast
+import json
+from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -37,15 +39,6 @@ def _update_sae_lens_training_version(sae: TrainingSAE) -> None:
     sae.cfg.sae_lens_training_version = str(__version__)
 
 
-class SaveCheckpointFn(Protocol):
-    def __call__(
-        self,
-        trainer: "SAETrainer",
-        checkpoint_name: str,
-        wandb_aliases: Optional[list[str]] = None,
-    ) -> None: ...
-
-
 @dataclass
 class TrainSAEOutput:
     sae: TrainingSAE
@@ -58,19 +51,23 @@ class SAETrainer:
     Core SAE class used for inference. For training, see TrainingSAE.
     """
 
+    model: HookedRootModule
+    sae: TrainingSAE
+    activation_store: ActivationsStore
+    cfg: LanguageModelSAERunnerConfig
+
     def __init__(
         self,
         model: HookedRootModule,
         sae: TrainingSAE,
         activation_store: ActivationsStore,
-        save_checkpoint_fn: SaveCheckpointFn,
         cfg: LanguageModelSAERunnerConfig,
     ) -> None:
         self.model = model
         self.sae = sae
         self.activation_store = activation_store
-        self.save_checkpoint = save_checkpoint_fn
         self.cfg = cfg
+        self._compile_if_needed()
 
         self.n_training_steps: int = 0
         self.n_training_tokens: int = 0
@@ -172,6 +169,31 @@ class SAETrainer:
     def dead_neurons(self) -> torch.Tensor:
         return (self.n_forward_passes_since_fired > self.cfg.dead_feature_window).bool()
 
+    def _compile_if_needed(self):
+        # Compile model and SAE
+        #  torch.compile can provide significant speedups (10-20% in testing)
+        # using max-autotune gives the best speedups but:
+        # (a) increases VRAM usage,
+        # (b) can't be used on both SAE and LM (some issue with cudagraphs), and
+        # (c) takes some time to compile
+        # optimal settings seem to be:
+        # use max-autotune on SAE and max-autotune-no-cudagraphs on LM
+        # (also pylance seems to really hate this)
+        if self.cfg.compile_llm:
+            self.model = torch.compile(
+                self.model,
+                mode=self.cfg.llm_compilation_mode,
+            )  # type: ignore
+
+        if self.cfg.compile_sae:
+            backend = "aot_eager" if self.cfg.device == "mps" else "inductor"
+
+            self.sae.training_forward_pass = torch.compile(  # type: ignore
+                self.sae.training_forward_pass,
+                mode=self.cfg.sae_compilation_mode,
+                backend=backend,
+            )  # type: ignore
+
     @torch.no_grad()
     def estimate_norm_scaling_factor(
         self, n_batches_for_norm_estimate: int = int(1e3)
@@ -185,11 +207,7 @@ class SAETrainer:
             acts = self.activation_store.next_batch()
             norms_per_batch.append(acts.norm(dim=-1).mean().item())
         mean_norm = np.mean(norms_per_batch)
-        scaling_factor = (
-            np.sqrt(self.cfg.d_in) / mean_norm
-        )  # TODO(oli-clive-griffin): cursor is suggesting I change this to `self.activation_store.d_sae`. Check the literature
-
-        return scaling_factor
+        return np.sqrt(self.cfg.d_in) / mean_norm
 
     def fit(self) -> TrainingSAE:
         pbar = tqdm(total=self.cfg.total_training_tokens, desc="Training SAE")
@@ -224,13 +242,60 @@ class SAETrainer:
 
         # save final sae group to checkpoints folder
         self.save_checkpoint(
-            trainer=self,
             checkpoint_name=f"final_{self.n_training_tokens}",
             wandb_aliases=["final_model"],
         )
 
         pbar.close()
         return self.sae
+
+    def save_checkpoint(
+        self,
+        checkpoint_name: str,
+        wandb_aliases: list[str] | None = None,
+    ) -> None:
+        """Save a checkpoint of the SAE locally and optionally to wandb."""
+
+        base_path = Path(self.cfg.checkpoint_path) / checkpoint_name
+        base_path.mkdir(exist_ok=True, parents=True)
+
+        if self.sae.cfg.normalize_sae_decoder:
+            self.sae.set_decoder_norm_to_unit_norm()
+
+        weights_path, cfg_path, sparsity_path = self.sae.save_model(
+            str(base_path),
+            self.log_feature_sparsity,
+        )
+
+        # let's over write the cfg file with the trainer cfg, which is a super set of the original cfg.
+        # and should not cause issues but give us more info about SAEs we trained in SAE Lens.
+        config = self.cfg.to_dict()
+        with open(cfg_path, "w") as f:
+            json.dump(config, f)
+
+        if self.cfg.log_to_wandb:
+            # Avoid wandb saving errors such as:
+            #   ValueError: Artifact name may only contain alphanumeric characters, dashes, underscores, and dots. Invalid name: sae_google/gemma-2b_etc
+            sae_name = self.sae.get_name().replace("/", "__")
+
+            # save model weights and cfg
+            model_artifact = wandb.Artifact(
+                sae_name,
+                type="model",
+                metadata=dict(self.cfg.__dict__),
+            )
+            model_artifact.add_file(str(weights_path))
+            model_artifact.add_file(str(cfg_path))
+            wandb.log_artifact(model_artifact, aliases=wandb_aliases)
+
+            # save log feature sparsity
+            sparsity_artifact = wandb.Artifact(
+                f"{sae_name}_log_feature_sparsity",
+                type="log_feature_sparsity",
+                metadata=dict(self.cfg.__dict__),
+            )
+            sparsity_artifact.add_file(str(sparsity_path))
+            wandb.log_artifact(sparsity_artifact)
 
     def _train_step(
         self,
@@ -411,10 +476,7 @@ class SAETrainer:
             self.checkpoint_thresholds
             and self.n_training_tokens > self.checkpoint_thresholds[0]
         ):
-            self.save_checkpoint(
-                trainer=self,
-                checkpoint_name=str(self.n_training_tokens),
-            )
+            self.save_checkpoint(checkpoint_name=str(self.n_training_tokens))
             self.checkpoint_thresholds.pop(0)
 
     @torch.no_grad()

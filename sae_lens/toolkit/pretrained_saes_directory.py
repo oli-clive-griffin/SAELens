@@ -55,7 +55,6 @@ def get_pretrained_saes_directory() -> dict[str, PretrainedSAELookup]:
     return directory
 
 
-# TODO(oli-clive-griffin) look at this for reference about saving the norm_scaling_factor
 def get_norm_scaling_factor(release: str, sae_id: str) -> Optional[float]:
     """
     Retrieve the norm_scaling_factor for a specific SAE if it exists.

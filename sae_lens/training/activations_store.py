@@ -3,7 +3,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-from pathlib import Path
 import warnings
 from typing import Any, Generator, Iterator, Literal, cast
 
@@ -654,7 +653,9 @@ class ActivationsStore:
         self._storage_buffer = mixing_buffer[: mixing_buffer.shape[0] // 2]
 
         # 3. put other 50 % in a dataloader
-        dataset = cast(TorchDataset[torch.Tensor], mixing_buffer[mixing_buffer.shape[0] // 2 :])
+        dataset = cast(
+            TorchDataset[torch.Tensor], mixing_buffer[mixing_buffer.shape[0] // 2 :]
+        )
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
